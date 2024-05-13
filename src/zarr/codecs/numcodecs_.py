@@ -167,9 +167,7 @@ class FixedScaleOffsetCodec(NumcodecsArrayArrayCodec):
     def resolve_metadata(self, chunk_spec: ArraySpec) -> ArraySpec:
         if astype := self.codec_config.get("astype"):
             return ArraySpec(
-                chunk_spec.shape,
-                np.dtype(astype),
-                chunk_spec.fill_value,
+                chunk_spec.shape, np.dtype(astype), chunk_spec.fill_value, chunk_spec.order
             )
         return chunk_spec
 
@@ -198,6 +196,7 @@ class AsTypeCodec(NumcodecsArrayArrayCodec):
             chunk_spec.shape,
             np.dtype(self.codec_config["encode_dtype"]),
             chunk_spec.fill_value,
+            chunk_spec.order,
         )
 
     def evolve(self, array_spec: ArraySpec) -> Self:
@@ -216,6 +215,7 @@ class PackbitsCodec(NumcodecsArrayArrayCodec):
             (1 + math.ceil(product(chunk_spec.shape) / 8),),
             np.dtype("uint8"),
             chunk_spec.fill_value,
+            chunk_spec.order,
         )
 
     def validate(self, array_metadata: ArrayMetadata) -> None:
