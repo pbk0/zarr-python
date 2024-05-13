@@ -10,7 +10,6 @@ from zarr.abc.codec import ArrayArrayCodec, BytesBytesCodec, Codec
 import numcodecs
 from zarr.codecs.registry import register_codec
 from zarr.common import JSON, ArraySpec, BytesLike, parse_named_configuration, product, to_thread
-from zarr.config import RuntimeConfiguration
 from zarr.metadata import ArrayMetadata
 
 CODEC_PREFIX = "https://zarr.dev/numcodecs/"
@@ -22,7 +21,7 @@ def parse_codec_configuration(data: dict[str, JSON], expected_name_prefix: str) 
         raise ValueError(
             f"Expected name to start with '{expected_name_prefix}'. Got {parsed_name} instead."
         )
-    id = parsed_name[len(expected_name_prefix):]
+    id = parsed_name[len(expected_name_prefix) :]
     return {"id": id, **parsed_configuration}
 
 
@@ -78,7 +77,6 @@ class NumcodecsBytesBytesCodec(NumcodecsCodec, BytesBytesCodec):
         self,
         chunk_bytes: BytesLike,
         _chunk_spec: ArraySpec,
-        _runtime_configuration: RuntimeConfiguration,
     ) -> BytesLike:
         return await to_thread(self._codec.decode, chunk_bytes)
 
@@ -92,7 +90,6 @@ class NumcodecsBytesBytesCodec(NumcodecsCodec, BytesBytesCodec):
         self,
         chunk_bytes: BytesLike,
         _chunk_spec: ArraySpec,
-        _runtime_configuration: RuntimeConfiguration,
     ) -> BytesLike:
         return await to_thread(self._encode, chunk_bytes)
 
@@ -105,7 +102,6 @@ class NumcodecsArrayArrayCodec(NumcodecsCodec, ArrayArrayCodec):
         self,
         chunk_array: np.ndarray,
         chunk_spec: ArraySpec,
-        _runtime_configuration: RuntimeConfiguration,
     ) -> np.ndarray:
         out = await to_thread(self._codec.decode, chunk_array)
         return out.reshape(chunk_spec.shape)
@@ -114,7 +110,6 @@ class NumcodecsArrayArrayCodec(NumcodecsCodec, ArrayArrayCodec):
         self,
         chunk_array: np.ndarray,
         _chunk_spec: ArraySpec,
-        _runtime_configuration: RuntimeConfiguration,
     ) -> np.ndarray:
         return await to_thread(self._codec.encode, chunk_array)
 

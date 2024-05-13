@@ -18,7 +18,6 @@ from zarr.abc.metadata import Metadata
 from zarr.array import AsyncArray, Array
 from zarr.attributes import Attributes
 from zarr.common import ZARR_JSON, ZARRAY_JSON, ZATTRS_JSON, ZGROUP_JSON
-from zarr.config import RuntimeConfiguration, SyncConfiguration
 from zarr.store import StoreLike, StorePath, make_store_path
 from zarr.sync import SyncMixin, sync
 
@@ -78,7 +77,6 @@ class GroupMetadata(Metadata):
 class AsyncGroup:
     metadata: GroupMetadata
     store_path: StorePath
-    runtime_configuration: RuntimeConfiguration = RuntimeConfiguration()
 
     @classmethod
     async def create(
@@ -88,7 +86,6 @@ class AsyncGroup:
         attributes: dict[str, Any] = {},
         exists_ok: bool = False,
         zarr_format: Literal[2, 3] = 3,
-        runtime_configuration: RuntimeConfiguration = RuntimeConfiguration(),
     ) -> AsyncGroup:
         store_path = make_store_path(store)
         if not exists_ok:
@@ -99,7 +96,6 @@ class AsyncGroup:
         group = cls(
             metadata=GroupMetadata(attributes=attributes, zarr_format=zarr_format),
             store_path=store_path,
-            runtime_configuration=runtime_configuration,
         )
         await group._save_metadata()
         return group
@@ -108,50 +104,62 @@ class AsyncGroup:
     async def open(
         cls,
         store: StoreLike,
-        runtime_configuration: RuntimeConfiguration = RuntimeConfiguration(),
-        zarr_format: Literal[2, 3] = 3,
+        zarr_format: Literal[2, 3, None] = 3,
     ) -> AsyncGroup:
         store_path = make_store_path(store)
-        zarr_json_bytes = await (store_path / ZARR_JSON).get()
-        assert zarr_json_bytes is not None
 
-        # TODO: consider trying to autodiscover the zarr-format here
-        if zarr_format == 3:
-            # V3 groups are comprised of a zarr.json object
-            # (it is optional in the case of implicit groups)
-            zarr_json_bytes = await (store_path / ZARR_JSON).get()
-            zarr_json = (
-                json.loads(zarr_json_bytes) if zarr_json_bytes is not None else {"zarr_format": 3}
-            )
-
-        elif zarr_format == 2:
-            # V2 groups are comprised of a .zgroup and .zattrs objects
-            # (both are optional in the case of implicit groups)
+        if zarr_format == 2:
             zgroup_bytes, zattrs_bytes = await asyncio.gather(
                 (store_path / ZGROUP_JSON).get(), (store_path / ZATTRS_JSON).get()
             )
-            zgroup = (
-                json.loads(json.loads(zgroup_bytes))
-                if zgroup_bytes is not None
-                else {"zarr_format": 2}
+            if zgroup_bytes is None:
+                raise KeyError(store_path)  # filenotfounderror?
+        elif zarr_format == 3:
+            zarr_json_bytes = await (store_path / ZARR_JSON).get()
+            if zarr_json_bytes is None:
+                raise KeyError(store_path)  # filenotfounderror?
+        elif zarr_format is None:
+            zarr_json_bytes, zgroup_bytes, zattrs_bytes = await asyncio.gather(
+                (store_path / ZARR_JSON).get(),
+                (store_path / ZGROUP_JSON).get(),
+                (store_path / ZATTRS_JSON).get(),
             )
-            zattrs = json.loads(json.loads(zattrs_bytes)) if zattrs_bytes is not None else {}
-            zarr_json = {**zgroup, "attributes": zattrs}
+            if zarr_json_bytes is not None and zgroup_bytes is not None:
+                # TODO: revisit this exception type
+                # alternatively, we could warn and favor v3
+                raise ValueError("Both zarr.json and .zgroup objects exist")
+            if zarr_json_bytes is None and zgroup_bytes is None:
+                raise KeyError(store_path)  # filenotfounderror?
+            # set zarr_format based on which keys were found
+            if zarr_json_bytes is not None:
+                zarr_format = 3
+            else:
+                zarr_format = 2
         else:
             raise ValueError(f"unexpected zarr_format: {zarr_format}")
-        return cls.from_dict(store_path, zarr_json, runtime_configuration)
+
+        if zarr_format == 2:
+            # V2 groups are comprised of a .zgroup and .zattrs objects
+            assert zgroup_bytes is not None
+            zgroup = json.loads(zgroup_bytes)
+            zattrs = json.loads(zattrs_bytes) if zattrs_bytes is not None else {}
+            group_metadata = {**zgroup, "attributes": zattrs}
+        else:
+            # V3 groups are comprised of a zarr.json object
+            assert zarr_json_bytes is not None
+            group_metadata = json.loads(zarr_json_bytes)
+
+        return cls.from_dict(store_path, group_metadata)
 
     @classmethod
     def from_dict(
         cls,
         store_path: StorePath,
         data: dict[str, Any],
-        runtime_configuration: RuntimeConfiguration,
     ) -> AsyncGroup:
         group = cls(
             metadata=GroupMetadata.from_dict(data),
             store_path=store_path,
-            runtime_configuration=runtime_configuration,
         )
         return group
 
@@ -174,21 +182,13 @@ class AsyncGroup:
         if self.metadata.zarr_format == 3:
             zarr_json_bytes = await (store_path / ZARR_JSON).get()
             if zarr_json_bytes is None:
-                # implicit group?
-                logger.warning("group at %s is an implicit group", store_path)
-                zarr_json = {
-                    "zarr_format": self.metadata.zarr_format,
-                    "node_type": "group",
-                    "attributes": {},
-                }
+                raise KeyError(key)
             else:
                 zarr_json = json.loads(zarr_json_bytes)
             if zarr_json["node_type"] == "group":
-                return type(self).from_dict(store_path, zarr_json, self.runtime_configuration)
+                return type(self).from_dict(store_path, zarr_json)
             elif zarr_json["node_type"] == "array":
-                return AsyncArray.from_dict(
-                    store_path, zarr_json, runtime_configuration=self.runtime_configuration
-                )
+                return AsyncArray.from_dict(store_path, zarr_json)
             else:
                 raise ValueError(f"unexpected node_type: {zarr_json['node_type']}")
         elif self.metadata.zarr_format == 2:
@@ -200,6 +200,9 @@ class AsyncGroup:
                 (store_path / ZATTRS_JSON).get(),
             )
 
+            if zgroup_bytes is None and zarray_bytes is None:
+                raise KeyError(key)
+
             # unpack the zarray, if this is None then we must be opening a group
             zarray = json.loads(zarray_bytes) if zarray_bytes else None
             # unpack the zattrs, this can be None if no attrs were written
@@ -208,20 +211,15 @@ class AsyncGroup:
             if zarray is not None:
                 # TODO: update this once the V2 array support is part of the primary array class
                 zarr_json = {**zarray, "attributes": zattrs}
-                return AsyncArray.from_dict(
-                    store_path, zarray, runtime_configuration=self.runtime_configuration
-                )
+                return AsyncArray.from_dict(store_path, zarray)
             else:
-                if zgroup_bytes is None:
-                    # implicit group?
-                    logger.warning("group at %s is an implicit group", store_path)
                 zgroup = (
                     json.loads(zgroup_bytes)
                     if zgroup_bytes is not None
                     else {"zarr_format": self.metadata.zarr_format}
                 )
                 zarr_json = {**zgroup, "attributes": zattrs}
-                return type(self).from_dict(store_path, zarr_json, self.runtime_configuration)
+                return type(self).from_dict(store_path, zarr_json)
         else:
             raise ValueError(f"unexpected zarr_format: {self.metadata.zarr_format}")
 
@@ -251,18 +249,14 @@ class AsyncGroup:
         return self.metadata.info
 
     async def create_group(self, path: str, **kwargs) -> AsyncGroup:
-        runtime_configuration = kwargs.pop("runtime_configuration", self.runtime_configuration)
         return await type(self).create(
             self.store_path / path,
-            runtime_configuration=runtime_configuration,
             **kwargs,
         )
 
     async def create_array(self, path: str, **kwargs) -> AsyncArray:
-        runtime_configuration = kwargs.pop("runtime_configuration", self.runtime_configuration)
         return await AsyncArray.create(
             self.store_path / path,
-            runtime_configuration=runtime_configuration,
             **kwargs,
         )
 
@@ -288,7 +282,12 @@ class AsyncGroup:
         return f"<AsyncGroup {self.store_path}>"
 
     async def nmembers(self) -> int:
-        raise NotImplementedError
+        # TODO: consider using aioitertools.builtins.sum for this
+        # return await aioitertools.builtins.sum((1 async for _ in self.members()), start=0)
+        n = 0
+        async for _ in self.members():
+            n += 1
+        return n
 
     async def members(self) -> AsyncGenerator[tuple[str, AsyncArray | AsyncGroup], None]:
         """
@@ -306,25 +305,29 @@ class AsyncGroup:
             )
 
             raise ValueError(msg)
-        subkeys = await self.store_path.store.list_dir(self.store_path.path)
         # would be nice to make these special keys accessible programmatically,
         # and scoped to specific zarr versions
-        subkeys_filtered = filter(lambda v: v not in ("zarr.json", ".zgroup", ".zattrs"), subkeys)
-        # is there a better way to schedule this?
-        for subkey in subkeys_filtered:
+        _skip_keys = ("zarr.json", ".zgroup", ".zattrs")
+        async for key in self.store_path.store.list_dir(self.store_path.path):
+            if key in _skip_keys:
+                continue
             try:
-                yield (subkey, await self.getitem(subkey))
+                yield (key, await self.getitem(key))
             except KeyError:
-                # keyerror is raised when `subkey` names an object (in the object storage sense),
+                # keyerror is raised when `key` names an object (in the object storage sense),
                 # as opposed to a prefix, in the store under the prefix associated with this group
-                # in which case `subkey` cannot be the name of a sub-array or sub-group.
+                # in which case `key` cannot be the name of a sub-array or sub-group.
                 logger.warning(
-                    "Object at %s is not recognized as a component of a Zarr hierarchy.", subkey
+                    "Object at %s is not recognized as a component of a Zarr hierarchy.", key
                 )
-                pass
 
     async def contains(self, member: str) -> bool:
-        raise NotImplementedError
+        # TODO: this can be made more efficient.
+        try:
+            await self.getitem(member)
+            return True
+        except KeyError:
+            return False
 
     # todo: decide if this method should be separate from `groups`
     async def group_keys(self) -> AsyncGenerator[str, None]:
@@ -384,7 +387,6 @@ class AsyncGroup:
 @dataclass(frozen=True)
 class Group(SyncMixin):
     _async_group: AsyncGroup
-    _sync_configuration: SyncConfiguration = field(init=True, default=SyncConfiguration())
 
     @classmethod
     def create(
@@ -393,16 +395,13 @@ class Group(SyncMixin):
         *,
         attributes: dict[str, Any] = {},
         exists_ok: bool = False,
-        runtime_configuration: RuntimeConfiguration = RuntimeConfiguration(),
     ) -> Group:
         obj = sync(
             AsyncGroup.create(
                 store,
                 attributes=attributes,
                 exists_ok=exists_ok,
-                runtime_configuration=runtime_configuration,
             ),
-            loop=runtime_configuration.asyncio_loop,
         )
 
         return cls(obj)
@@ -411,11 +410,8 @@ class Group(SyncMixin):
     def open(
         cls,
         store: StoreLike,
-        runtime_configuration: RuntimeConfiguration = RuntimeConfiguration(),
     ) -> Group:
-        obj = sync(
-            AsyncGroup.open(store, runtime_configuration), loop=runtime_configuration.asyncio_loop
-        )
+        obj = sync(AsyncGroup.open(store))
         return cls(obj)
 
     def __getitem__(self, path: str) -> Array | Group:
@@ -493,26 +489,18 @@ class Group(SyncMixin):
     def __contains__(self, member) -> bool:
         return self._sync(self._async_group.contains(member))
 
-    def group_keys(self) -> list[str]:
-        # uncomment with AsyncGroup implements this method
-        # return self._sync_iter(self._async_group.group_keys())
-        raise NotImplementedError
+    def group_keys(self) -> tuple[str, ...]:
+        return tuple(self._sync_iter(self._async_group.group_keys()))
 
-    def groups(self) -> list[Group]:
+    def groups(self) -> tuple[Group, ...]:
         # TODO: in v2 this was a generator that return key: Group
-        # uncomment with AsyncGroup implements this method
-        # return [Group(obj) for obj in self._sync_iter(self._async_group.groups())]
-        raise NotImplementedError
+        return tuple(Group(obj) for obj in self._sync_iter(self._async_group.groups()))
 
-    def array_keys(self) -> list[str]:
-        # uncomment with AsyncGroup implements this method
-        # return self._sync_iter(self._async_group.array_keys)
-        raise NotImplementedError
+    def array_keys(self) -> tuple[str, ...]:
+        return tuple(self._sync_iter(self._async_group.array_keys()))
 
-    def arrays(self) -> list[Array]:
-        # uncomment with AsyncGroup implements this method
-        # return [Array(obj) for obj in self._sync_iter(self._async_group.arrays)]
-        raise NotImplementedError
+    def arrays(self) -> tuple[Array, ...]:
+        return tuple(Array(obj) for obj in self._sync_iter(self._async_group.arrays()))
 
     def tree(self, expand=False, level=None) -> Any:
         return self._sync(self._async_group.tree(expand=expand, level=level))

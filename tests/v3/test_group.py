@@ -10,7 +10,6 @@ import numpy as np
 
 from zarr.group import AsyncGroup, Group, GroupMetadata
 from zarr.store import LocalStore, StorePath
-from zarr.config import RuntimeConfiguration
 
 
 # todo: put RemoteStore in here
@@ -41,17 +40,11 @@ def test_group_members(store_type, request):
 
     # add an extra object to the domain of the group.
     # the list of children should ignore this object.
-    sync(store.set(f"{path}/extra_object", b"000000"))
+    sync(store.set(f"{path}/extra_object-1", b"000000"))
     # add an extra object under a directory-like prefix in the domain of the group.
-    # this creates an implicit group called implicit_subgroup
-    sync(store.set(f"{path}/implicit_subgroup/extra_object", b"000000"))
-    # make the implicit subgroup
-    members_expected["implicit_subgroup"] = Group(
-        AsyncGroup(
-            metadata=GroupMetadata(),
-            store_path=StorePath(store=store, path=f"{path}/implicit_subgroup"),
-        )
-    )
+    # this creates a directory with a random key in it
+    # this should not show up as a member
+    sync(store.set(f"{path}/extra_directory/extra_object-2", b"000000"))
     members_observed = group.members
     # members are not guaranteed to be ordered, so sort before comparing
     assert sorted(dict(members_observed)) == sorted(members_expected)
@@ -64,7 +57,6 @@ def test_group(store_type, request) -> None:
     agroup = AsyncGroup(
         metadata=GroupMetadata(),
         store_path=store_path,
-        runtime_configuration=RuntimeConfiguration(),
     )
     group = Group(agroup)
     assert agroup.metadata is group.metadata
@@ -105,7 +97,6 @@ def test_group_sync_constructor(store_path) -> None:
     group = Group.create(
         store=store_path,
         attributes={"title": "test 123"},
-        runtime_configuration=RuntimeConfiguration(),
     )
 
     assert group._async_group.metadata.attributes["title"] == "test 123"
